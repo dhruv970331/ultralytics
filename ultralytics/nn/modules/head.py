@@ -44,14 +44,20 @@ class Detect(nn.Module):
         nl (int): Number of detection layers.
         reg_max (int): DFL channels.
         no (int): Number of outputs per anchor.
+        var_ch (int): Number of variance outputs per anchor (xyxy log-variance channels, default 4).
+        var_fmt (str): Coordinate system for variance outputs, e.g. "xyxy" or "xywh".
         stride (torch.Tensor): Strides computed during build.
         cv2 (nn.ModuleList): Convolution layers for box regression.
         cv3 (nn.ModuleList): Convolution layers for classification.
+        cv4 (nn.ModuleList): Convolution layers for variance (log-variance) regression.
         dfl (nn.Module): Distribution Focal Loss layer.
         one2one_cv2 (nn.ModuleList): One-to-one convolution layers for box regression.
         one2one_cv3 (nn.ModuleList): One-to-one convolution layers for classification.
+        one2one_cv4 (nn.ModuleList): One-to-one convolution layers for variance regression.
+
 
     Methods:
+        forward_head: Concatenates and returns predicted bounding boxes, class probabilities, and variance (log-variance).
         forward: Perform forward pass and return predictions.
         forward_end2end: Perform forward pass for end-to-end detection.
         bias_init: Initialize detection head biases.
@@ -90,6 +96,11 @@ class Detect(nn.Module):
         self.nl = len(ch)  # number of detection layers
         self.reg_max = reg_max  # DFL channels (ch[0] // 16 to scale 4/8/12/16/20 for n/s/m/l/x)
         self.no = nc + self.reg_max * 4  # number of outputs per anchor
+
+        # NEW: log-Variance channels (x1, y1, x2, y2) or (x, y, w, h)
+        self.var_ch = 4
+        self.var_fmt = "xywh"
+
         self.stride = torch.zeros(self.nl)  # strides computed during build
         c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
         self.cv2 = nn.ModuleList(
@@ -107,21 +118,33 @@ class Detect(nn.Module):
                 for x in ch
             )
         )
+        
+        # --- NEW: Aleatoric Variance Head (cv4) ---
+        # Learns log-variance for xyxy coordinates
+        c4 = max(ch[0] // 4, self.var_ch)
+        self.cv4 = nn.ModuleList(
+            nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.var_ch, 1)) for x in ch
+        )
+        # ------------------------------------------
+        
         self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
 
         if end2end:
             self.one2one_cv2 = copy.deepcopy(self.cv2)
             self.one2one_cv3 = copy.deepcopy(self.cv3)
+            self.one2one_cv4 = copy.deepcopy(self.cv4) # Clone for end2end
+
 
     @property
     def one2many(self):
         """Returns the one-to-many head components, here for v5/v5/v8/v9/11 backward compatibility."""
-        return dict(box_head=self.cv2, cls_head=self.cv3)
+        # Include var_head in the dict passed to forward_head
+        return dict(box_head=self.cv2, cls_head=self.cv3, var_head=self.cv4)
 
     @property
     def one2one(self):
         """Returns the one-to-one head components."""
-        return dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3)
+        return dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3, var_head=self.one2one_cv4)
 
     @property
     def end2end(self):
@@ -134,7 +157,7 @@ class Detect(nn.Module):
         self._end2end = value
 
     def forward_head(
-        self, x: list[torch.Tensor], box_head: torch.nn.Module = None, cls_head: torch.nn.Module = None
+        self, x: list[torch.Tensor], box_head: torch.nn.Module = None, cls_head: torch.nn.Module = None, var_head: torch.nn.Module = None  # Add argument
     ) -> dict[str, torch.Tensor]:
         """Concatenates and returns predicted bounding boxes and class probabilities."""
         if box_head is None or cls_head is None:  # for fused inference
@@ -142,7 +165,17 @@ class Detect(nn.Module):
         bs = x[0].shape[0]  # batch size
         boxes = torch.cat([box_head[i](x[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], dim=-1)
         scores = torch.cat([cls_head[i](x[i]).view(bs, self.nc, -1) for i in range(self.nl)], dim=-1)
-        return dict(boxes=boxes, scores=scores, feats=x)
+
+        # --- NEW: Compute Variance ---
+        # Output shape: [BS, 4, Anchors]
+        variance = None
+        if var_head is not None:
+            variance = torch.cat([var_head[i](x[i]).view(bs, self.var_ch, -1) for i in range(self.nl)], dim=-1)
+            # Clamp for numerical stability (approx exp(-9) to exp(9))
+            variance = variance.clamp(min=-9.0, max=9.0)
+        # -----------------------------
+
+        return dict(boxes=boxes, scores=scores, variance=variance, feats=x)
 
     def forward(
         self, x: list[torch.Tensor]
@@ -190,12 +223,21 @@ class Detect(nn.Module):
             b[-1].bias.data[: self.nc] = math.log(
                 5 / self.nc / (640 / self.stride[i]) ** 2
             )  # cls (.01 objects, 80 classes, 640 img)
+        
+        # --- NEW: Init Variance Head (one2many) ---
+        for a in self.one2many["var_head"]:
+            a[-1].bias.data[:] = 0.0 # Initialize to 0 (unit variance after exp)
+        
         if self.end2end:
             for i, (a, b) in enumerate(zip(self.one2one["box_head"], self.one2one["cls_head"])):  # from
                 a[-1].bias.data[:] = 2.0  # box
                 b[-1].bias.data[: self.nc] = math.log(
                     5 / self.nc / (640 / self.stride[i]) ** 2
                 )  # cls (.01 objects, 80 classes, 640 img)
+            
+            # --- NEW: Init Variance Head (one2one) ---
+            for a in self.one2one["var_head"]:
+                a[-1].bias.data[:] = 0.0
 
     def decode_bboxes(self, bboxes: torch.Tensor, anchors: torch.Tensor, xywh: bool = True) -> torch.Tensor:
         """Decode bounding boxes from predictions."""
@@ -249,7 +291,7 @@ class Detect(nn.Module):
 
     def fuse(self) -> None:
         """Remove the one2many head for inference optimization."""
-        self.cv2 = self.cv3 = None
+        self.cv2 = self.cv3 = self.cv4 = None
 
 
 class Segment(Detect):
