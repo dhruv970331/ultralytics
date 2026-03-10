@@ -330,6 +330,34 @@ class KeypointLoss(nn.Module):
         return (kpt_loss_factor.view(-1, 1) * ((1 - torch.exp(-e)) * kpt_mask)).mean()
 
 
+# --- HELPER: Gaussian NLL with Weighting & Normalization ---
+def gaussian_nll_loss(pred_bboxes, pred_log_var, target_bboxes, weight, scores_sum):
+    """
+    Weighted Gaussian Negative Log-Likelihood Loss.
+    Args:
+        pred_bboxes: [N, 4] (Mean boxes, xyxy)
+        pred_log_var: [N, 4] (Log Variance)
+        target_bboxes: [N, 4] (Target boxes, xyxy)
+        weight: [N, 1] (Target score weights)
+        scores_sum: Scalar (Normalization factor)
+    """
+    # Squared Error: (y - y_hat)^2
+    squared_error = (pred_bboxes - target_bboxes).pow(2)
+    
+    # Precision: exp(-s)
+    precision = torch.exp(-pred_log_var)
+    
+    # NLL: 0.5 * (exp(-s) * error^2 + s)
+    loss = 0.5 * (precision * squared_error + pred_log_var)
+    
+    # Sum over coordinates (x,y,x,y), keep dim for weighting
+    loss = loss.sum(-1, keepdim=True) # [N, 1]
+    
+    # Apply weights (quality of detection) and normalize
+    return (loss * weight).sum() / scores_sum
+# -----------------------------------------------------------
+
+
 class v8DetectionLoss:
     """Criterion class for computing training losses for YOLOv8 object detection."""
 
@@ -395,6 +423,13 @@ class v8DetectionLoss:
             preds["boxes"].permute(0, 2, 1).contiguous(),
             preds["scores"].permute(0, 2, 1).contiguous(),
         )
+
+        # --- NEW: Extract Variance ---
+        # Shape: [B, 4, Anchors] -> Permute to [B, Anchors, 4]
+        # This aligns with pred_bboxes (B, Anchors, 4)
+        pred_log_var = preds["variance"].permute(0, 2, 1).contiguous()
+        # -----------------------------
+
         anchor_points, stride_tensor = make_anchors(preds["feats"], self.stride, 0.5)
 
         dtype = pred_scores.dtype
@@ -419,24 +454,56 @@ class v8DetectionLoss:
             mask_gt,
         )
 
-        target_scores_sum = max(target_scores.sum(), 1)
+        # target_scores_sum = max(target_scores.sum(), 1)
+        target_scores_sum = target_scores.sum().clamp(min=1.0)
 
         # Cls loss
         loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
 
         # Bbox loss
         if fg_mask.sum():
+            # Normalize targets to get Grid-Space targets
+            target_bboxes_grid = target_bboxes / stride_tensor
+            
             loss[0], loss[2] = self.bbox_loss(
                 pred_distri,
                 pred_bboxes,
                 anchor_points,
-                target_bboxes / stride_tensor,
+                target_bboxes_grid,
                 target_scores,
                 target_scores_sum,
                 fg_mask,
                 imgsz,
                 stride_tensor,
             )
+
+            # --- NEW: Aleatoric NLL Loss (Weighted & Stable) ---
+            # 1. Get Weight (same as BboxLoss)
+            weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
+            
+            # 2. Detach Mean Boxes (Gradients stop here for mean head)
+            pred_bboxes_detached = pred_bboxes.detach()
+            
+            # --- OPTIONAL: Convert to xywh for strict equation compliance ---
+            # xyxy2xywh handles the conversion: [x1, y1, x2, y2] -> [cx, cy, w, h]
+            pred_bboxes_detached = xyxy2xywh(pred_bboxes_detached)
+            target_bboxes_grid = xyxy2xywh(target_bboxes_grid)
+            # mu = torch.cat([pred_bboxes_detached[..., :2], (pred_bboxes_detached[..., 2:]).clamp_min(eps).log()], dim=-1)
+            # t = torch.cat([target_bboxes_grid[..., :2], (target_bboxes_grid[..., 2:]).clamp_min(eps).log()], dim=-1)
+            
+            # 3. Compute NLL (Force Float32 for stability)
+            with autocast(enabled=False):
+                loss_nll = gaussian_nll_loss(
+                    pred_bboxes_detached[fg_mask].float(), 
+                    pred_log_var[fg_mask].float(), 
+                    target_bboxes_grid[fg_mask].float(), 
+                    weight.float(),
+                    target_scores_sum.float()
+                )
+            
+            # 4. Add to Box Loss (scaled by 0.1)
+            loss[0] += 0.1 * loss_nll
+            # ---------------------------------------------------
 
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
