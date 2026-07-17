@@ -82,7 +82,16 @@ class Detect(nn.Module):
     legacy = False  # backward compatibility for v3/v5/v8/v9 models
     xyxy = False  # xyxy or xywh output
 
-    def __init__(self, nc: int = 80, reg_max=16, end2end=False, ch: tuple = ()):
+
+    # def __init__(self, *args, **kwargs):
+    #     super().__init__()
+    #     print("\n===== DEBUG DETECT INIT =====")
+    #     print("ARGS LEN:", len(args))
+    #     print("ARGS:", args)
+    #     print("KWARGS:", kwargs)
+    #     raise RuntimeError("DEBUG STOP: printed Detect init args")
+        
+    def __init__(self, nc: int = 80, reg_max=16, end2end=False, dropout=0.0, ch: tuple = ()):
         """Initialize the YOLO detection layer with specified number of classes and channels.
 
         Args:
@@ -92,6 +101,7 @@ class Detect(nn.Module):
             ch (tuple): Tuple of channel sizes from backbone feature maps.
         """
         super().__init__()
+        # print("legacy-----------", legacy)
         self.nc = nc  # number of classes
         self.nl = len(ch)  # number of detection layers
         self.reg_max = reg_max  # DFL channels (ch[0] // 16 to scale 4/8/12/16/20 for n/s/m/l/x)
@@ -100,6 +110,10 @@ class Detect(nn.Module):
         # NEW: log-Variance channels (x1, y1, x2, y2) or (x, y, w, h)
         self.var_ch = 4
         self.var_fmt = "xywh"
+
+        # INITIALIZE DROPOUT (Using Dropout2d for spatial feature maps)
+        print("dropout init")
+        self.dropout_layer = nn.Dropout2d(p=dropout)
 
         self.stride = torch.zeros(self.nl)  # strides computed during build
         c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
@@ -163,14 +177,22 @@ class Detect(nn.Module):
         if box_head is None or cls_head is None:  # for fused inference
             return dict()
         bs = x[0].shape[0]  # batch size
-        boxes = torch.cat([box_head[i](x[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], dim=-1)
-        scores = torch.cat([cls_head[i](x[i]).view(bs, self.nc, -1) for i in range(self.nl)], dim=-1)
+
+        # Applying Dropout BEFORE routing to the heads
+        # This ensures the spatial features dropped are synchronized across box, class, and variance predictions.
+        # Guarded with getattr for backward-compat: Deep Ensemble checkpoints were trained before the
+        # dropout_layer was added (it came in for MCDO), so an absent layer == no dropout, which is
+        # exactly the intended behaviour for a non-MCDO model.
+        dropout = getattr(self, "dropout_layer", None)
+        dropped_x = [dropout(xi) for xi in x] if dropout is not None else list(x)
+        boxes = torch.cat([box_head[i](dropped_x[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], dim=-1)
+        scores = torch.cat([cls_head[i](dropped_x[i]).view(bs, self.nc, -1) for i in range(self.nl)], dim=-1)
 
         # --- NEW: Compute Variance ---
         # Output shape: [BS, 4, Anchors]
         variance = None
         if var_head is not None:
-            variance = torch.cat([var_head[i](x[i]).view(bs, self.var_ch, -1) for i in range(self.nl)], dim=-1)
+            variance = torch.cat([var_head[i](dropped_x[i]).view(bs, self.var_ch, -1) for i in range(self.nl)], dim=-1)
             # Clamp for numerical stability (approx exp(-9) to exp(9))
             variance = variance.clamp(min=-9.0, max=9.0)
         # -----------------------------
